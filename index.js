@@ -23,6 +23,7 @@ const {
   calculateDynamicSlippage,
   getLiquiditySummary,
   getV2PairLiquidity,
+  batchGetSwapQuotes,
   POOLS_CONFIG,
   TOKENS
 } = require("./liquidity.js");
@@ -36,30 +37,80 @@ const LiquidationAbi = require("./abis/Liquidation.json");
 const AaveOracleAbi = require("./abis/AaveOracle.json");
 const DataProviderAbi = require("./abis/DataProvider.json");
 
-const provider = new providers.JsonRpcProvider(config.rpc_url);
+// ============================================
+// DUAL RPC SYSTEM
+// - publicProvider: lecturas (gratis, Flow público)
+// - txProvider: transacciones (Alchemy, más confiable)
+// ============================================
+const PUBLIC_RPC = 'https://mainnet.evm.nodes.onflow.org';
+const TX_RPC = config.rpc_url; // Alchemy
+
+let provider = new providers.JsonRpcProvider(PUBLIC_RPC); // Lecturas
+const txProvider = new providers.JsonRpcProvider(TX_RPC); // Solo para TX
+
+let usingAlchemyFallback = false;
+
+/**
+ * Switch read provider to Alchemy (fallback if public fails)
+ */
+function switchToAlchemyFallback() {
+  if (usingAlchemyFallback) return;
+  console.log(`[RPC] Switching reads to Alchemy (fallback)...`);
+  provider = new providers.JsonRpcProvider(TX_RPC);
+  reinitializeContracts();
+  usingAlchemyFallback = true;
+}
+
+/**
+ * Switch back to public RPC for reads
+ */
+function switchToPublicRpc() {
+  if (!usingAlchemyFallback) return;
+  console.log(`[RPC] Switching reads back to public RPC...`);
+  provider = new providers.JsonRpcProvider(PUBLIC_RPC);
+  reinitializeContracts();
+  usingAlchemyFallback = false;
+}
+
+/**
+ * Get current read RPC URL
+ */
+function getCurrentRpc() {
+  return usingAlchemyFallback ? TX_RPC : PUBLIC_RPC;
+}
 
 // Interfaces
 const poolInterface = new utils.Interface(PoolAbi);
 const mTokenInterface = new utils.Interface(MTokenAbi);
 
-// Contracts
-const multicallContract = new Contract(
+// Contracts (will be reinitialized on RPC switch)
+let multicallContract = new Contract(
   config.contracts.multicall,
   MulticallAbi,
   provider
 );
 
-const oracleContract = new Contract(
+let oracleContract = new Contract(
   config.contracts.oracle,
   AaveOracleAbi,
   provider
 );
 
-const dataProviderContract = new Contract(
+let dataProviderContract = new Contract(
   config.contracts.dataProvider,
   DataProviderAbi,
   provider
 );
+
+/**
+ * Reinitialize contracts after RPC switch
+ */
+function reinitializeContracts() {
+  multicallContract = new Contract(config.contracts.multicall, MulticallAbi, provider);
+  oracleContract = new Contract(config.contracts.oracle, AaveOracleAbi, provider);
+  dataProviderContract = new Contract(config.contracts.dataProvider, DataProviderAbi, provider);
+  console.log('[RPC] Contracts reinitialized');
+}
 
 // Constants
 const WFLOW = config.contracts.wflow;
@@ -77,23 +128,174 @@ const MIN_DEBT_USD = config.min_debt_usd || 1;
  */
 function calculateGasMultiplier(profitUsd) {
   // Liquidation bonus is ~5%, so profit ~ 5% of debt
-  // We're willing to spend up to 20% of profit on gas to win
+  // Aggressive gas to win against competitors
   //
   // Profit tiers:
-  // < $5:     1.5x (small, don't overpay)
-  // $5-$50:   2.0x (worth competing)
-  // $50-$200: 3.0x (good opportunity)
-  // $200+:    4.0x (big fish, max aggression)
+  // < $5:      1.5x (small, don't overpay)
+  // $5-$50:    2.5x (worth competing)
+  // $50-$200:  4.0x (good opportunity)
+  // $200-$1k:  5.0x (big fish)
+  // $1k-$5k:   6.0x (whale)
+  // $5k+:      8.0x (mega whale, MAX aggression)
 
-  if (profitUsd < 5) return 150;      // 1.5x base
-  if (profitUsd < 50) return 200;     // 2x for medium
-  if (profitUsd < 200) return 300;    // 3x for good opportunities
-  return 400;                          // 4x for big positions
+  if (profitUsd < 5) return 150;       // 1.5x base
+  if (profitUsd < 50) return 250;      // 2.5x for medium
+  if (profitUsd < 200) return 400;     // 4x for good opportunities
+  if (profitUsd < 1000) return 500;    // 5x for big fish
+  if (profitUsd < 5000) return 600;    // 6x for whales
+  return 800;                           // 8x for mega positions
 }
 
 // PunchSwap configuration
 const PUNCHSWAP_ROUTER = config.contracts.punchswap?.router;
 const FLASH_SWAP_PAIRS = config.contracts.flashSwapPairs || {};
+
+// ============================================
+// STABLEKITTY POOLS (Curve-style, low slippage for stables)
+// ============================================
+const STABLEKITTY_POOLS = {
+  'PYUSD0_stgUSDC': {
+    address: '0x0e9712Ad7dbC3c0AC25765f57E8805C3fd3cF717',
+    token0: '0x99aF3EeA856556646C98c8B9b2548Fe815240750', // PYUSD0
+    token1: '0xF1815bd50389c46847f0Bda824eC8da914045D14', // stgUSDC
+    token0Index: 0,
+    token1Index: 1
+  },
+  'USDF_PYUSD0': {
+    address: '0x6ddDFa511A940cA3fD5Ec7F6a4f23947cA30f030',
+    token0: '0x2aaBea2058b5aC2D339b163C6Ab6f2b6d53aabED', // USDF
+    token1: '0x99aF3EeA856556646C98c8B9b2548Fe815240750', // PYUSD0
+    token0Index: 0,
+    token1Index: 1
+  },
+  'USDF_stgUSDC': {
+    address: '0x20ca5d1C8623ba6AC8f02E41cCAFFe7bb6C92B57',
+    token0: '0x2aaBea2058b5aC2D339b163C6Ab6f2b6d53aabED', // USDF
+    token1: '0xF1815bd50389c46847f0Bda824eC8da914045D14', // stgUSDC
+    token0Index: 0,
+    token1Index: 1
+  }
+};
+
+// Stablecoins (for detecting stable↔stable swaps)
+const STABLECOINS = new Set([
+  '0x99af3eea856556646c98c8b9b2548fe815240750', // PYUSD0
+  '0xf1815bd50389c46847f0bda824ec8da914045d14', // stgUSDC
+  '0x2aabea2058b5ac2d339b163c6ab6f2b6d53aabed', // USDF
+]);
+
+// StableKitty ABI (Curve-style)
+const STABLEKITTY_ABI = [
+  'function get_dy(int128 i, int128 j, uint256 dx) view returns (uint256)',
+  'function exchange(int128 i, int128 j, uint256 dx, uint256 min_dy, address receiver) returns (uint256)',
+  'function balances(uint256 i) view returns (uint256)'
+];
+
+const STABLEKITTY_SLIPPAGE_BPS = 50n; // 0.5% max slippage for StableKitty
+
+/**
+ * Check if swap is between stablecoins
+ */
+function isStableSwap(tokenA, tokenB) {
+  return STABLECOINS.has(tokenA.toLowerCase()) && STABLECOINS.has(tokenB.toLowerCase());
+}
+
+/**
+ * Find StableKitty pool for a token pair
+ */
+function findStableKittyPool(tokenA, tokenB) {
+  const a = tokenA.toLowerCase();
+  const b = tokenB.toLowerCase();
+
+  for (const [name, pool] of Object.entries(STABLEKITTY_POOLS)) {
+    const p0 = pool.token0.toLowerCase();
+    const p1 = pool.token1.toLowerCase();
+
+    if ((a === p0 && b === p1) || (a === p1 && b === p0)) {
+      return {
+        ...pool,
+        name,
+        inputIndex: a === p0 ? pool.token0Index : pool.token1Index,
+        outputIndex: a === p0 ? pool.token1Index : pool.token0Index,
+      };
+    }
+  }
+  return null;
+}
+
+/**
+ * Get quote from StableKitty pool
+ */
+async function getStableKittyQuote(pool, amountIn) {
+  try {
+    const contract = new Contract(pool.address, STABLEKITTY_ABI, provider);
+    const amountOut = await contract.get_dy(pool.inputIndex, pool.outputIndex, amountIn);
+    return BigNumber.from(amountOut);
+  } catch (err) {
+    console.log(`[StableKitty] Quote error: ${err.message?.slice(0, 50)}`);
+    return null;
+  }
+}
+
+/**
+ * Build swap params for StableKitty (uses swapType 3 with local calldata)
+ */
+function buildStableKittySwapParams(pool, amountIn, minAmountOut, receiver) {
+  const iface = new utils.Interface(STABLEKITTY_ABI);
+  const calldata = iface.encodeFunctionData('exchange', [
+    pool.inputIndex,
+    pool.outputIndex,
+    amountIn,
+    minAmountOut,
+    receiver
+  ]);
+
+  const abiCoder = new utils.AbiCoder();
+  const path = abiCoder.encode(
+    ['address', 'address', 'bytes'],
+    [pool.token0, pool.token1, calldata]
+  );
+
+  return {
+    swapType: 3, // ApiAggregator - works with any calldata
+    router: pool.address,
+    path: path,
+    amountIn: amountIn.toString(),
+    amountOutMin: minAmountOut.toString(),
+    adapters: []
+  };
+}
+
+/**
+ * Build V2 swap params directly (without Eisen API)
+ */
+function buildV2SwapParamsLocal(fromToken, toToken, amountIn, minAmountOut, router) {
+  const path = [fromToken, toToken];
+  const encodedPath = utils.defaultAbiCoder.encode(['address[]'], [path]);
+
+  return {
+    swapType: 0, // V2
+    router: router,
+    path: encodedPath,
+    amountIn: amountIn.toString(),
+    amountOutMin: minAmountOut.toString(),
+    adapters: []
+  };
+}
+
+/**
+ * Build empty swap params
+ */
+function buildEmptySwapParamsLocal() {
+  return {
+    swapType: 0,
+    router: constants.AddressZero,
+    path: '0x',
+    amountIn: '0',
+    amountOutMin: '0',
+    adapters: []
+  };
+}
 
 /**
  * Check if Flash Swap is available for a given debt token
@@ -248,7 +450,7 @@ async function getV3Liquidity() {
 // ============================================
 // CACHE SYSTEM - Reduce RPC calls
 // ============================================
-const CACHE_TTL_MS = 10000; // 10 seconds TTL for prices
+const CACHE_TTL_MS = 5000; // 5 seconds TTL for prices (faster updates)
 const priceCache = new Map(); // token -> { price, timestamp }
 const reserveConfigCache = new Map(); // token -> { config, timestamp }
 
@@ -331,6 +533,199 @@ async function batchGetPrices(tokens) {
 // ============================================
 // Track positions close to liquidation with pre-calculated trigger prices
 const hotPositions = new Map(); // user -> { hf, debt, collaterals, triggerPrices, lastUpdate }
+
+// ============================================
+// POSITION BLACKLIST (FAILED LIQUIDATIONS)
+// ============================================
+// Track positions that consistently fail with negative rewards to avoid infinite loops
+const failedPositions = new Map(); // user -> { failures, lastAttempt, reason }
+const MAX_FAILURES_BEFORE_BLACKLIST = 3; // Skip after 3 consecutive failures
+const BLACKLIST_TTL_MS = 5 * 60 * 1000; // Clear blacklist after 5 minutes (market conditions may change)
+
+/**
+ * Record a failed liquidation attempt
+ * @param {string} user - User address
+ * @param {string} reason - Reason for failure
+ */
+function recordFailedLiquidation(user, reason) {
+  const existing = failedPositions.get(user) || { failures: 0, lastAttempt: 0, reason: '' };
+  failedPositions.set(user, {
+    failures: existing.failures + 1,
+    lastAttempt: Date.now(),
+    reason
+  });
+}
+
+/**
+ * Check if position should be skipped due to repeated failures
+ * @param {string} user - User address
+ * @returns {boolean} True if should skip
+ */
+function shouldSkipPosition(user) {
+  const failed = failedPositions.get(user);
+  if (!failed) return false;
+
+  // Clear old entries (older than BLACKLIST_TTL_MS)
+  if (Date.now() - failed.lastAttempt > BLACKLIST_TTL_MS) {
+    failedPositions.delete(user);
+    return false;
+  }
+
+  return failed.failures >= MAX_FAILURES_BEFORE_BLACKLIST;
+}
+
+/**
+ * Clear successful liquidations from blacklist
+ * @param {string} user - User address
+ */
+function clearFailedPosition(user) {
+  failedPositions.delete(user);
+}
+
+// ============================================
+// ADAPTIVE LIQUIDATION PERCENTAGES
+// ============================================
+// Try different liquidation percentages to find the optimal one
+const LIQUIDATION_PERCENTAGES = [10n, 25n, 50n]; // Try 10%, 25%, then 50%
+
+/**
+ * Try different liquidation percentages to find the most profitable one
+ * @param {BigNumber} userDebt - Total user debt
+ * @param {Object} context - Liquidation context (collateral, debt assets, etc.)
+ * @returns {Object} Best percentage and expected profit
+ */
+async function findOptimalLiquidationPercentage(userDebt, context) {
+  const results = [];
+
+  for (const percentage of LIQUIDATION_PERCENTAGES) {
+    try {
+      const debtToCover = userDebt.mul(percentage).div(100n);
+
+      // Add interest buffer
+      const INTEREST_BUFFER_BPS = 10n;
+      const debtWithBuffer = debtToCover.mul(10000n + INTEREST_BUFFER_BPS).div(10000n);
+
+      // Calculate expected profit for this percentage
+      const profitEstimate = await estimateLiquidationProfit(debtWithBuffer, context);
+
+      results.push({
+        percentage: Number(percentage),
+        debtToCover: debtWithBuffer,
+        estimatedProfit: profitEstimate.profitUsd,
+        profitPerGas: profitEstimate.profitUsd / profitEstimate.estimatedGas
+      });
+
+      console.log(`  [Adaptive] ${percentage}%: profit $${profitEstimate.profitUsd.toFixed(2)}, gas efficiency ${(profitEstimate.profitUsd / profitEstimate.estimatedGas * 1000).toFixed(2)}`);
+
+      // If not profitable, don't try higher percentages
+      if (profitEstimate.profitUsd <= 0) {
+        break;
+      }
+    } catch (error) {
+      console.log(`  [Adaptive] ${percentage}% failed:`, error.message);
+      break;
+    }
+  }
+
+  if (results.length === 0 || results.every(r => r.estimatedProfit <= 0)) {
+    return null; // No profitable percentage found
+  }
+
+  // Return the percentage with best profit per gas ratio
+  const best = results
+    .filter(r => r.estimatedProfit > 0)
+    .sort((a, b) => b.profitPerGas - a.profitPerGas)[0];
+
+  console.log(`  [Adaptive] ✅ Using ${best.percentage}% (best profit/gas ratio)`);
+  return best;
+}
+
+/**
+ * Estimate profit for a given liquidation amount
+ * @param {BigNumber} debtToCover - Debt amount to liquidate
+ * @param {Object} context - Liquidation context
+ * @returns {Object} Profit estimate
+ */
+async function estimateLiquidationProfit(debtToCover, context) {
+  const { collateralAsset, debtAsset, collateralDecimals, debtDecimals, strategyResult } = context;
+
+  // Calculate total needed including fees
+  let totalNeeded;
+  if (strategyResult.strategy === Strategy.V2_FLASH_SWAP) {
+    const flashSwapFee = debtToCover.mul(FLASH_SWAP_FEE_BPS).div(10000n);
+    totalNeeded = debtToCover.add(flashSwapFee);
+  } else if (strategyResult.strategy === Strategy.V3_FLASH) {
+    const v3Fee = strategyResult.fee || 30;
+    const flashFee = debtToCover.mul(BigInt(v3Fee)).div(10000n);
+    totalNeeded = debtToCover.add(flashFee);
+  } else {
+    const flashLoanPremium = debtToCover.mul(FLASH_LOAN_PREMIUM_BPS).div(10000n);
+    totalNeeded = debtToCover.add(flashLoanPremium);
+  }
+
+  // Calculate expected collateral
+  const expectedCollateral = await calculateExpectedCollateral(
+    totalNeeded,
+    collateralAsset,
+    debtAsset,
+    collateralDecimals,
+    debtDecimals
+  );
+
+  // Estimate swap output (collateral -> debt)
+  const swapOutput = await estimateSwapOutput(
+    expectedCollateral,
+    collateralAsset,
+    debtAsset,
+    strategyResult
+  );
+
+  // Profit = swap output - total needed
+  const profitInDebtToken = swapOutput.sub(totalNeeded);
+  const profitUsd = Number(profitInDebtToken.toString()) / Math.pow(10, debtDecimals) * 0.9999; // Assume USDF ≈ $1
+
+  // Estimate gas (rough)
+  const estimatedGas = strategyResult.strategy === Strategy.EISEN_FLASH_LOAN ? 500000 : 300000;
+
+  return {
+    profitUsd,
+    estimatedGas,
+    swapOutput,
+    totalNeeded
+  };
+}
+
+/**
+ * Estimate swap output for collateral -> debt conversion
+ * @param {BigNumber} collateralAmount - Amount of collateral
+ * @param {string} collateralAsset - Collateral token address
+ * @param {string} debtAsset - Debt token address
+ * @param {Object} strategyResult - Selected strategy
+ * @returns {BigNumber} Estimated output in debt token
+ */
+async function estimateSwapOutput(collateralAmount, collateralAsset, debtAsset, strategyResult) {
+  // Simple estimation based on oracle prices (will be pessimistic if pool price is worse)
+  const oracleCollateralPrice = await oracleContract.getAssetPrice(collateralAsset);
+  const oracleDebtPrice = await oracleContract.getAssetPrice(debtAsset);
+
+  // Convert collateral value to debt token amount
+  // This is optimistic - actual swap will be worse due to slippage
+  const collateralValueInDebt = collateralAmount
+    .mul(oracleCollateralPrice)
+    .div(oracleDebtPrice);
+
+  // Apply estimated slippage based on strategy
+  let slippageFactor;
+  if (strategyResult.strategy === Strategy.V2_FLASH_SWAP) {
+    slippageFactor = 970n; // 3% slippage
+  } else if (strategyResult.strategy === Strategy.V3_FLASH) {
+    slippageFactor = 990n; // 1% slippage
+  } else {
+    slippageFactor = 950n; // 5% slippage for aggregator
+  }
+
+  return collateralValueInDebt.mul(slippageFactor).div(1000n);
+}
 
 // ============================================
 // PREPARED LIQUIDATIONS CACHE
@@ -435,14 +830,6 @@ async function prepareLiquidationParams(user, pool, totalDebtBase) {
     ]);
     const userDebt = dInfos[0].amount;
 
-    // Calculate debt to cover (50% close factor + 0.1% buffer)
-    const CLOSE_FACTOR = 50n;
-    const INTEREST_BUFFER_BPS = 10n;
-    const maxLiquidatable = userDebt.mul(CLOSE_FACTOR).div(100n);
-    let debtToCover = userDebt.gt(debtBalanceInmToken) ? debtBalanceInmToken : userDebt;
-    debtToCover = debtToCover.gt(maxLiquidatable) ? maxLiquidatable : debtToCover;
-    debtToCover = debtToCover.mul(10000n + INTEREST_BUFFER_BPS).div(10000n);
-
     const collateralAsset = mInfos[0].token[0];
     const collateralContract = new Contract(collateralAsset, MTokenAbi, provider);
     const collateralDecimals = await collateralContract.decimals();
@@ -451,14 +838,39 @@ async function prepareLiquidationParams(user, pool, totalDebtBase) {
     const debtValueUsd = Number(totalDebtBase.toString()) / 1e8;
     const dynamicSlippage = calculateDynamicSlippage(debtValueUsd);
 
-    // Select strategy
+    // Select strategy FIRST (needed for adaptive calculation)
     const strategyResult = await selectBestStrategy(
       collateralAsset,
       debtAsset,
-      debtToCover,
+      userDebt.div(2n), // Use 50% for initial strategy selection
       BigNumber.from(0),
       provider
     );
+
+    // 🔥 ADAPTIVE LIQUIDATION: Try different percentages to find optimal
+    console.log(`[Adaptive] Testing liquidation percentages for ${shortAddr(user)}...`);
+    const adaptiveResult = await findOptimalLiquidationPercentage(userDebt, {
+      collateralAsset,
+      debtAsset,
+      collateralDecimals,
+      debtDecimals,
+      strategyResult
+    });
+
+    if (!adaptiveResult) {
+      console.log(`[Prepared] Error for ${shortAddr(user)}: No profitable percentage found`);
+      // Record as failed to blacklist
+      recordFailedLiquidation(user, 'No profitable percentage');
+      preparingUsers.delete(user);
+      return null;
+    }
+
+    let debtToCover = adaptiveResult.debtToCover;
+
+    // Cap to available debt in pool
+    debtToCover = userDebt.gt(debtBalanceInmToken)
+      ? (debtBalanceInmToken.gt(debtToCover) ? debtToCover : debtBalanceInmToken)
+      : debtToCover;
 
     // Calculate expected collateral based on strategy
     let totalNeeded;
@@ -568,6 +980,391 @@ function cleanExpiredPrepared() {
     if (now - data.timestamp > PREPARED_TTL_MS) {
       preparedLiquidations.delete(user);
     }
+  }
+}
+
+/**
+ * BATCH prepare liquidation params for multiple positions
+ * Much more efficient than calling prepareLiquidationParams() for each
+ *
+ * @param {Array} positions - Array of { user, pool, totalDebtBase }
+ * @returns {Object} { prepared: number, failed: number, timing: { balances, quotes, total } }
+ */
+// Max users per batch to avoid RPC limits (~7M gas at 50 users)
+const BATCH_CHUNK_SIZE = 50;
+
+async function batchPreparePositions(positions) {
+  if (!positions || positions.length === 0) return { prepared: 0, failed: 0, timing: {} };
+
+  const pool = positions[0].pool;
+  const botInfo = config.bots[pool];
+  if (!botInfo) return { prepared: 0, failed: 0, timing: {} };
+
+  const timingStart = Date.now();
+  const timing = {};
+
+  // Filter out already preparing/prepared users
+  const toProcess = positions.filter(p =>
+    !preparingUsers.has(p.user) && !preparedLiquidations.has(p.user)
+  );
+
+  if (toProcess.length === 0) return { prepared: 0, failed: 0, timing: {} };
+
+  // If too many users, process in chunks to avoid RPC limits
+  if (toProcess.length > BATCH_CHUNK_SIZE) {
+    console.log(`[BatchPrepare] ${toProcess.length} users > ${BATCH_CHUNK_SIZE} limit, chunking...`);
+    let totalPrepared = 0;
+    let totalFailed = 0;
+
+    for (let i = 0; i < toProcess.length; i += BATCH_CHUNK_SIZE) {
+      const chunk = toProcess.slice(i, i + BATCH_CHUNK_SIZE);
+      console.log(`[BatchPrepare] Chunk ${Math.floor(i/BATCH_CHUNK_SIZE) + 1}/${Math.ceil(toProcess.length/BATCH_CHUNK_SIZE)}: ${chunk.length} users`);
+
+      const result = await batchPreparePositions(chunk);
+      totalPrepared += result.prepared;
+      totalFailed += result.failed;
+    }
+
+    return { prepared: totalPrepared, failed: totalFailed, timing: { total: Date.now() - timingStart } };
+  }
+
+  // Mark all as preparing
+  toProcess.forEach(p => preparingUsers.add(p.user));
+
+  console.log(`[BatchPrepare] Processing ${toProcess.length} positions...`);
+
+  try {
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 1: Batch get all mToken/dToken balances for all users
+    // ═══════════════════════════════════════════════════════════════
+    const balanceStart = Date.now();
+    const balanceCalls = [];
+    const callsPerUser = (botInfo.mTokens.length + botInfo.dTokens.length) * 2;
+
+    for (const pos of toProcess) {
+      // mTokens: balanceOf + UNDERLYING_ASSET_ADDRESS
+      for (const mToken of botInfo.mTokens) {
+        balanceCalls.push({
+          target: mToken,
+          callData: mTokenInterface.encodeFunctionData("balanceOf", [pos.user])
+        });
+        balanceCalls.push({
+          target: mToken,
+          callData: mTokenInterface.encodeFunctionData("UNDERLYING_ASSET_ADDRESS", [])
+        });
+      }
+      // dTokens: balanceOf + UNDERLYING_ASSET_ADDRESS
+      for (const dToken of botInfo.dTokens) {
+        balanceCalls.push({
+          target: dToken,
+          callData: mTokenInterface.encodeFunctionData("balanceOf", [pos.user])
+        });
+        balanceCalls.push({
+          target: dToken,
+          callData: mTokenInterface.encodeFunctionData("UNDERLYING_ASSET_ADDRESS", [])
+        });
+      }
+    }
+
+    const balanceResults = await multicallContract.callStatic.aggregate(balanceCalls);
+    timing.balances = Date.now() - balanceStart;
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 2: Parse balance results to find collateral/debt per user
+    // ═══════════════════════════════════════════════════════════════
+    const userAssets = new Map(); // user -> { collateralAsset, debtAsset, collateralAmount, debtAmount, ... }
+
+    for (let userIdx = 0; userIdx < toProcess.length; userIdx++) {
+      const pos = toProcess[userIdx];
+      const startIdx = userIdx * callsPerUser;
+
+      const mInfos = [];
+      const dInfos = [];
+      const tokensWithUnderlying = [];
+
+      let callIdx = startIdx;
+
+      // Parse mToken results
+      for (let i = 0; i < botInfo.mTokens.length; i++) {
+        const balanceData = balanceResults.returnData[callIdx];
+        const underlyingData = balanceResults.returnData[callIdx + 1];
+
+        const balance = mTokenInterface.decodeFunctionResult("balanceOf", balanceData)[0];
+        const underlying = mTokenInterface.decodeFunctionResult("UNDERLYING_ASSET_ADDRESS", underlyingData)[0];
+
+        if (balance.gt(0)) {
+          mInfos.push({ token: underlying, amount: balance });
+        }
+        tokensWithUnderlying.push({
+          token: underlying.toLowerCase(),
+          mtoken: botInfo.mTokens[i]
+        });
+
+        callIdx += 2;
+      }
+
+      // Parse dToken results
+      for (let i = 0; i < botInfo.dTokens.length; i++) {
+        const balanceData = balanceResults.returnData[callIdx];
+        const underlyingData = balanceResults.returnData[callIdx + 1];
+
+        const balance = mTokenInterface.decodeFunctionResult("balanceOf", balanceData)[0];
+        const underlying = mTokenInterface.decodeFunctionResult("UNDERLYING_ASSET_ADDRESS", underlyingData)[0];
+
+        if (balance.gt(0)) {
+          dInfos.push({ token: underlying, amount: balance });
+        }
+
+        callIdx += 2;
+      }
+
+      // Skip if no collateral or debt
+      if (mInfos.length === 0 || dInfos.length === 0) {
+        preparingUsers.delete(pos.user);
+        continue;
+      }
+
+      const collateralAsset = mInfos[0].token;
+      const debtAsset = dInfos[0].token;
+      const debtMToken = tokensWithUnderlying.find(t => t.token === debtAsset.toLowerCase());
+
+      if (!debtMToken) {
+        preparingUsers.delete(pos.user);
+        continue;
+      }
+
+      userAssets.set(pos.user, {
+        collateralAsset,
+        debtAsset,
+        collateralAmount: mInfos[0].amount,
+        debtAmount: dInfos[0].amount,
+        debtMToken: debtMToken.mtoken,
+        totalDebtBase: pos.totalDebtBase,
+        pool: pos.pool
+      });
+    }
+
+    if (userAssets.size === 0) {
+      toProcess.forEach(p => preparingUsers.delete(p.user));
+      return { prepared: 0, failed: toProcess.length, timing };
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 3: Get decimals and additional info (batch)
+    // ═══════════════════════════════════════════════════════════════
+    const uniqueTokens = new Set();
+    for (const assets of userAssets.values()) {
+      uniqueTokens.add(assets.collateralAsset);
+      uniqueTokens.add(assets.debtAsset);
+    }
+
+    const decimalCalls = Array.from(uniqueTokens).map(token => ({
+      target: token,
+      callData: mTokenInterface.encodeFunctionData("decimals", [])
+    }));
+
+    const decimalResults = await multicallContract.callStatic.aggregate(decimalCalls);
+    const decimalsMap = new Map();
+    Array.from(uniqueTokens).forEach((token, idx) => {
+      const dec = mTokenInterface.decodeFunctionResult("decimals", decimalResults.returnData[idx])[0];
+      decimalsMap.set(token.toLowerCase(), dec);
+    });
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 4: Batch get oracle prices for all tokens
+    // ═══════════════════════════════════════════════════════════════
+    const oracleStart = Date.now();
+    const oracleInterface = new utils.Interface(AaveOracleAbi);
+    const oracleCalls = Array.from(uniqueTokens).map(token => ({
+      target: config.contracts.oracle,
+      callData: oracleInterface.encodeFunctionData("getAssetPrice", [token])
+    }));
+
+    const oracleResults = await multicallContract.callStatic.aggregate(oracleCalls);
+    const priceMap = new Map();
+    Array.from(uniqueTokens).forEach((token, idx) => {
+      const price = oracleInterface.decodeFunctionResult("getAssetPrice", oracleResults.returnData[idx])[0];
+      priceMap.set(token.toLowerCase(), price);
+    });
+    timing.oracle = Date.now() - oracleStart;
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 5: Build quote pairs for ALL percentages (10%, 25%, 50%)
+    // ═══════════════════════════════════════════════════════════════
+    const quoteStart = Date.now();
+    const quotePairs = [];
+    const PERCENTAGES = [10n, 25n, 50n]; // Test 10%, 25%, 50%
+    const LIQUIDATION_BONUS = 1050n; // 5% bonus
+
+    for (const [user, assets] of userAssets) {
+      // Select strategy (doesn't need RPC, just pool config lookup)
+      const strategyResult = await selectBestStrategy(
+        assets.debtAsset,
+        assets.collateralAsset,
+        assets.debtAmount,
+        provider
+      );
+
+      const collateralDecimals = decimalsMap.get(assets.collateralAsset.toLowerCase());
+      const debtDecimals = decimalsMap.get(assets.debtAsset.toLowerCase());
+      const collateralPrice = priceMap.get(assets.collateralAsset.toLowerCase());
+      const debtPrice = priceMap.get(assets.debtAsset.toLowerCase());
+
+      // Store basic info
+      assets.strategyResult = strategyResult;
+      assets.collateralDecimals = collateralDecimals;
+      assets.debtDecimals = debtDecimals;
+      assets.collateralPrice = collateralPrice;
+      assets.debtPrice = debtPrice;
+
+      // Add quote pair for EACH percentage
+      for (const pct of PERCENTAGES) {
+        // Calculate debt to liquidate for this percentage
+        const debtToLiquidate = assets.debtAmount.mul(pct).div(100n);
+
+        // Expected collateral = debt * debtPrice / collateralPrice * (1 + bonus)
+        const expectedCollateral = debtToLiquidate
+          .mul(debtPrice)
+          .mul(LIQUIDATION_BONUS)
+          .div(collateralPrice)
+          .div(1000n);
+
+        quotePairs.push({
+          tokenIn: assets.collateralAsset,
+          tokenOut: assets.debtAsset,
+          amountIn: expectedCollateral,
+          id: `${user}|${pct}` // Format: user|percentage
+        });
+      }
+    }
+
+    // Batch get ALL quotes for ALL users and ALL percentages in ONE multicall
+    const quotes = await batchGetSwapQuotes(
+      quotePairs,
+      config.contracts.multicall,
+      config.contracts.punchswap.router,
+      provider
+    );
+    timing.quotes = Date.now() - quoteStart;
+
+    // ═══════════════════════════════════════════════════════════════
+    // STEP 6: Group quotes by user and select best percentage
+    // ═══════════════════════════════════════════════════════════════
+    let preparedCount = 0;
+    let failedCount = 0;
+
+    // Group quotes by user
+    const quotesByUser = new Map();
+    for (const quote of quotes) {
+      const [user, pctStr] = quote.id.split('|');
+      const pct = BigInt(pctStr);
+
+      if (!quotesByUser.has(user)) {
+        quotesByUser.set(user, []);
+      }
+      quotesByUser.get(user).push({ quote, pct });
+    }
+
+    // Process each user and find best percentage
+    for (const [user, userQuotes] of quotesByUser) {
+      const assets = userAssets.get(user);
+
+      if (!assets) {
+        preparingUsers.delete(user);
+        failedCount++;
+        continue;
+      }
+
+      // Calculate profit for each percentage and find the best
+      let bestOption = null;
+      let bestProfitUsd = -Infinity;
+
+      for (const { quote, pct } of userQuotes) {
+        if (!quote.best) continue;
+
+        const debtToLiquidate = assets.debtAmount.mul(pct).div(100n);
+        const swapOutput = quote.best.amountOut;
+
+        // Calculate fees based on strategy
+        let totalFees;
+        if (assets.strategyResult.strategy === Strategy.V2_FLASH_SWAP) {
+          totalFees = debtToLiquidate.mul(30).div(10000); // 0.3%
+        } else if (assets.strategyResult.strategy === Strategy.V3_FLASH) {
+          const fee = assets.strategyResult.fee || 30;
+          totalFees = debtToLiquidate.mul(BigInt(fee)).div(10000);
+        } else {
+          totalFees = debtToLiquidate.mul(5).div(10000); // 0.05% flash loan
+        }
+
+        const profitInDebtToken = swapOutput.sub(debtToLiquidate).sub(totalFees);
+        const profitUsd = Number(profitInDebtToken.toString()) / Math.pow(10, assets.debtDecimals);
+
+        // Calculate expected collateral for this percentage
+        const expectedCollateral = debtToLiquidate
+          .mul(assets.debtPrice)
+          .mul(1050n) // 5% bonus
+          .div(assets.collateralPrice)
+          .div(1000n);
+
+        if (profitUsd > bestProfitUsd) {
+          bestProfitUsd = profitUsd;
+          bestOption = {
+            pct,
+            quote: quote.best,
+            debtToLiquidate,
+            expectedCollateral,
+            profitUsd
+          };
+        }
+      }
+
+      if (!bestOption || bestOption.profitUsd <= 0) {
+        preparingUsers.delete(user);
+        failedCount++;
+        console.log(`[BatchPrepare] ${shortAddr(user)} skipped - no profitable %`);
+        continue;
+      }
+
+      // Store prepared params with BEST percentage
+      const prepared = {
+        user,
+        pool: assets.pool,
+        botAddress: config.bots[assets.pool].bot,
+        collateralAsset: assets.collateralAsset,
+        debtAsset: assets.debtAsset,
+        collateralDecimals: assets.collateralDecimals,
+        debtDecimals: assets.debtDecimals,
+        debtToCover: bestOption.debtToLiquidate,
+        userDebt: assets.debtAmount,
+        debtBalanceInmToken: assets.debtAmount,
+        expectedCollateral: bestOption.expectedCollateral,
+        strategyResult: assets.strategyResult,
+        quote: bestOption.quote,
+        liquidationPct: Number(bestOption.pct),
+        estimatedProfitUsd: bestOption.profitUsd,
+        timestamp: Date.now()
+      };
+
+      preparedLiquidations.set(user, prepared);
+      preparingUsers.delete(user);
+      preparedCount++;
+
+      const profitStr = bestOption.profitUsd >= 0 ? `+$${bestOption.profitUsd.toFixed(2)}` : `-$${Math.abs(bestOption.profitUsd).toFixed(2)}`;
+      console.log(`[BatchPrepare] ${shortAddr(user)} ready - ${bestOption.pct}% ${bestOption.quote.type} ${profitStr}`);
+    }
+
+    timing.total = Date.now() - timingStart;
+
+    console.log(`[BatchPrepare] Done: ${preparedCount} prepared, ${failedCount} failed`);
+    console.log(`[BatchPrepare] Timing: balances=${timing.balances}ms, oracle=${timing.oracle}ms, quotes=${timing.quotes}ms, total=${timing.total}ms`);
+    console.log(`[BatchPrepare] Efficiency: ${userAssets.size} users × 3 pcts = ${quotePairs.length} quotes in 1 multicall`);
+
+    return { prepared: preparedCount, failed: failedCount, timing };
+
+  } catch (err) {
+    console.error(`[BatchPrepare] Error: ${err.message}`);
+    toProcess.forEach(p => preparingUsers.delete(p.user));
+    return { prepared: 0, failed: toProcess.length, timing };
   }
 }
 
@@ -930,14 +1727,19 @@ async function main() {
     }
   }
 
-  // 3. Filter unhealthy users (HF < 1)
+  // 3. Filter unhealthy users (HF < 1) - SORTED BY DEBT SIZE (biggest first)
   const unhealthyUsers = allUsersHealthRes.filter(
     (userHealth) =>
       userHealth.healthFactor.lte(constants.WeiPerEther) && userHealth.healthFactor.gt(0)
-  );
+  ).sort((a, b) => {
+    // Sort by debt descending (biggest positions first = more profit)
+    const debtA = Number(a.totalDebtBase.toString());
+    const debtB = Number(b.totalDebtBase.toString());
+    return debtB - debtA;
+  });
 
   // Filter users close to liquidation (1.0 <= HF < 1.10) - NON-DUST only
-  // Sorted by HF ascending (closest to liquidation first)
+  // Sorted by PRIORITY SCORE: debt * (1/HF) - bigger debt + lower HF = higher priority
   const wideUnhealthyUsers = allUsersHealthRes.filter((userHealth) => {
     if (!userHealth.healthFactor.lt(constants.WeiPerEther.mul(110).div(100))) return false; // HF < 1.10
     if (!userHealth.healthFactor.gte(constants.WeiPerEther)) return false; // HF >= 1.0
@@ -945,10 +1747,14 @@ async function main() {
     const debtUsd = Number(userHealth.totalDebtBase.toString()) / 1e8;
     return debtUsd >= MIN_DEBT_USD;
   }).sort((a, b) => {
-    // Sort by HF ascending (closest to liquidation first)
-    const hfA = Number(a.healthFactor.toString());
-    const hfB = Number(b.healthFactor.toString());
-    return hfA - hfB;
+    // Priority score: debt * (1/HF) - rewards big positions close to liquidation
+    const debtA = Number(a.totalDebtBase.toString());
+    const debtB = Number(b.totalDebtBase.toString());
+    const hfA = Number(a.healthFactor.toString()) / 1e18;
+    const hfB = Number(b.healthFactor.toString()) / 1e18;
+    const priorityA = debtA / hfA;
+    const priorityB = debtB / hfB;
+    return priorityB - priorityA; // Higher priority first
   });
 
   // Update hot positions tracker with trigger prices
@@ -981,8 +1787,8 @@ async function main() {
   console.log(`Checking ${unhealthyUsers.length} potentially liquidatable users...`);
   console.log(`${wideUnhealthyUsers.length} users close to liquidation (HF < 1.05)`);
 
-  // 5. Execute liquidations
-  const liquidator = new Wallet(config.liquidator_key, provider);
+  // 5. Execute liquidations (use txProvider for sending transactions)
+  const liquidator = new Wallet(config.liquidator_key, txProvider);
 
   for (const unhealthyUser of unhealthyUsers) {
     const botInfo = config.bots[unhealthyUser.pool];
@@ -1116,6 +1922,13 @@ async function main() {
       continue;
     }
 
+    // Skip positions that have repeatedly failed
+    if (shouldSkipPosition(unhealthyUser.user)) {
+      const failed = failedPositions.get(unhealthyUser.user);
+      console.log(`⏭️  SKIPPING blacklisted position: ${shortAddr(unhealthyUser.user)} (${failed.failures} failures: ${failed.reason})`);
+      continue;
+    }
+
     // Count actual liquidatable (non-dust)
     actualLiquidatable++;
 
@@ -1208,7 +2021,149 @@ async function main() {
         const effectiveDebtToCover = adjustedDebtToCover;
 
         // ============================================
-        // STRATEGY 1: V2 FlashSwap (PunchSwap) - PRIMERA OPCIÓN
+        // STRATEGY 0: STABLEKITTY + MORE FLASH LOAN
+        // Best for stable↔stable swaps (0.01% fee, low slippage)
+        // ============================================
+        if (!txReceipt && isStableSwap(collateralAsset, debtAsset)) {
+          const stablePool = findStableKittyPool(collateralAsset, debtAsset);
+
+          if (stablePool) {
+            console.log(`[StableKitty] Stable↔Stable detected: ${stablePool.name}`);
+
+            const flashLoanPremium = effectiveDebtToCover.mul(FLASH_LOAN_PREMIUM_BPS).div(10000n);
+            const totalNeeded = effectiveDebtToCover.add(flashLoanPremium);
+
+            const expectedCollateral = await calculateExpectedCollateral(
+              totalNeeded,
+              collateralAsset,
+              debtAsset,
+              collateralDecimals,
+              debtDecimals
+            );
+
+            // Get StableKitty quote
+            const stableQuote = await getStableKittyQuote(stablePool, expectedCollateral);
+
+            if (stableQuote && stableQuote.gte(totalNeeded)) {
+              const minOutput = totalNeeded; // We need at least this much to repay
+
+              try {
+                console.log(`[StableKitty] Quote: ${expectedCollateral.toString()} col → ${stableQuote.toString()} debt`);
+
+                sParamToRepayLoan = buildStableKittySwapParams(
+                  stablePool,
+                  expectedCollateral,
+                  minOutput,
+                  contractAddress
+                );
+                sParamToSendToReceiver = buildEmptySwapParamsLocal();
+                estimatedReward = stableQuote.sub(totalNeeded);
+
+                const lParam = {
+                  collateralAsset,
+                  debtAsset,
+                  user: unhealthyUser.user,
+                  amount: effectiveDebtToCover,
+                  transferAmount: 0,
+                  debtToCover: userDebt.gt(debtBalanceInmToken) ? debtBalanceInmToken : constants.MaxUint256,
+                };
+
+                // Simulate
+                await botContract.callStatic.execute(
+                  lParam,
+                  sParamToRepayLoan,
+                  sParamToSendToReceiver,
+                  liquidator.address,
+                  { from: liquidator.address }
+                );
+                console.log('[StableKitty Simulation] OK - proceeding with tx');
+
+                const gasPrice = await provider.getGasPrice();
+                const adjustedGasPrice = gasPrice.mul(gasMultiplier).div(100);
+
+                // Execute
+                tx = await botContract
+                  .connect(liquidator)
+                  .execute(
+                    lParam,
+                    sParamToRepayLoan,
+                    sParamToSendToReceiver,
+                    liquidator.address,
+                    { gasLimit: 4000000, gasPrice: adjustedGasPrice }
+                  );
+
+                console.log(`[StableKitty TX] Sent: ${tx.hash}`);
+                txReceipt = await tx.wait();
+
+                if (txReceipt.status === 1) {
+                  console.log(`[StableKitty TX] SUCCESS!`);
+                  successCollateral = collateralAsset;
+                  usedStrategy = 'STABLEKITTY_MORE';
+                } else {
+                  throw new Error('Transaction reverted');
+                }
+
+              } catch (err) {
+                const reason = err?.error?.reason || err?.reason || err?.message || 'Unknown';
+                console.log(`[StableKitty+MORE] Failed: ${reason.slice(0, 80)}`);
+                lastError = err;
+
+                // Try StableKitty + V3 Flash if MORE failed
+                const v3Pool = strategyResult.strategy === Strategy.V3_FLASH
+                  ? strategyResult.pool
+                  : strategyResult.alternatives?.find(a => a.strategy === Strategy.V3_FLASH)?.pool;
+
+                if (v3Pool && !txReceipt) {
+                  try {
+                    console.log(`[StableKitty+V3] Trying V3 flash source...`);
+
+                    await botContract.callStatic.executeFlashV3(
+                      v3Pool,
+                      lParam,
+                      sParamToRepayLoan,
+                      sParamToSendToReceiver,
+                      liquidator.address,
+                      { from: liquidator.address }
+                    );
+                    console.log('[StableKitty+V3 Simulation] OK');
+
+                    const gasPrice = await provider.getGasPrice();
+                    const adjustedGasPrice = gasPrice.mul(gasMultiplier).div(100);
+
+                    tx = await botContract
+                      .connect(liquidator)
+                      .executeFlashV3(
+                        v3Pool,
+                        lParam,
+                        sParamToRepayLoan,
+                        sParamToSendToReceiver,
+                        liquidator.address,
+                        { gasLimit: 4000000, gasPrice: adjustedGasPrice }
+                      );
+
+                    console.log(`[StableKitty+V3 TX] Sent: ${tx.hash}`);
+                    txReceipt = await tx.wait();
+
+                    if (txReceipt.status === 1) {
+                      console.log(`[StableKitty+V3 TX] SUCCESS!`);
+                      successCollateral = collateralAsset;
+                      usedStrategy = 'STABLEKITTY_V3';
+                    }
+                  } catch (v3Err) {
+                    console.log(`[StableKitty+V3] Failed: ${(v3Err?.message || '').slice(0, 60)}`);
+                  }
+                }
+              }
+            } else {
+              console.log(`[StableKitty] Quote insufficient, falling back...`);
+            }
+          } else {
+            console.log(`[StableKitty] No pool for ${shortAddr(collateralAsset)}→${shortAddr(debtAsset)}`);
+          }
+        }
+
+        // ============================================
+        // STRATEGY 1: V2 FlashSwap (PunchSwap)
         // Más simple, sin dependencia de API externa
         // Fee: 0.3%
         // ============================================
@@ -1280,7 +2235,7 @@ async function main() {
                   sParamToRepayLoan,
                   sParamToSendToReceiver,
                   liquidator.address,
-                  { gasLimit: 2500000, gasPrice: adjustedGasPrice }
+                  { gasLimit: 4000000, gasPrice: adjustedGasPrice }
                 );
 
               console.log(`[V2 FlashSwap TX] Sent: ${tx.hash}`);
@@ -1302,8 +2257,8 @@ async function main() {
 
               const isSwapError = reason.includes('SwapFailed') || reason.includes('NoReward') || reason.includes('not profitable');
               if (!isSwapError) {
-                console.log(`[V2 FlashSwap] Non-swap error, trying next strategy...`);
-                break; // Non-swap error, try next strategy
+                console.log(`[V2 FlashSwap] Non-swap error for this collateral, continuing...`);
+                // Don't break - let it try other strategies for this collateral
               }
             }
           }
@@ -1386,7 +2341,7 @@ async function main() {
                     sParamToRepayLoan,
                     sParamToSendToReceiver,
                     liquidator.address,
-                    { gasLimit: 2500000, gasPrice: adjustedGasPrice }
+                    { gasLimit: 4000000, gasPrice: adjustedGasPrice }
                   );
 
                 console.log(`[V3 Flash TX] Sent: ${tx.hash}`);
@@ -1408,8 +2363,8 @@ async function main() {
 
                 const isSwapError = reason.includes('SwapFailed') || reason.includes('NoReward') || reason.includes('not profitable');
                 if (!isSwapError) {
-                  console.log(`[V3 Flash] Non-swap error, trying Eisen...`);
-                  break;
+                  console.log(`[V3 Flash] Non-swap error for this collateral, trying Eisen...`);
+                  // Continue to try Eisen for this collateral
                 }
               }
             }
@@ -1417,17 +2372,17 @@ async function main() {
         }
 
         // ============================================
-        // STRATEGY 3: Eisen + Aave Flash Loan - ÚLTIMA OPCIÓN
-        // Para tokens sin pools directas (stFLOW, etc)
-        // Fee: 0.05% + swap fees
+        // STRATEGY 3: Aave Flash Loan + V2 Swap Directo
+        // Sin API externa, usa quotes locales
+        // Fee: 0.05% + 0.3% swap
         // ============================================
         if (!txReceipt) {
           const flashLoanPremium = effectiveDebtToCover.mul(FLASH_LOAN_PREMIUM_BPS).div(10000n);
           const totalNeeded = effectiveDebtToCover.add(flashLoanPremium);
 
           if (colIdx === 0) {
-            console.log(`[Eisen FlashLoan] Premium: ${flashLoanPremium.toString()}`);
-            console.log(`[Eisen FlashLoan] Total needed: ${totalNeeded.toString()}`);
+            console.log(`[V2 Direct] Aave Flash + V2 Swap (no Eisen)`);
+            console.log(`[V2 Direct] Total needed: ${totalNeeded.toString()}`);
           }
 
           const expectedCollateral = await calculateExpectedCollateral(
@@ -1440,7 +2395,168 @@ async function main() {
 
           for (const slippage of SLIPPAGE_LEVELS) {
             try {
-              console.log(`[Eisen FlashLoan] Collateral ${colIdx + 1}, Slippage ${(slippage * 100).toFixed(1)}%...`);
+              console.log(`[V2 Direct] Collateral ${colIdx + 1}, Slippage ${(slippage * 100).toFixed(1)}%...`);
+
+              // Build V2 swap params locally (no API call)
+              const slippageBps = BigInt(Math.floor(slippage * 10000));
+              const minOutput = totalNeeded.mul(10000n - slippageBps).div(10000n);
+
+              sParamToRepayLoan = buildV2SwapParamsLocal(
+                collateralAsset,
+                debtAsset,
+                expectedCollateral,
+                minOutput,
+                PUNCHSWAP_ROUTER
+              );
+              sParamToSendToReceiver = buildEmptySwapParamsLocal();
+              estimatedReward = expectedCollateral.mul(5n).div(100n); // ~5% estimate
+
+              const lParam = {
+                collateralAsset,
+                debtAsset,
+                user: unhealthyUser.user,
+                amount: effectiveDebtToCover,
+                transferAmount: 0,
+                debtToCover: userDebt.gt(debtBalanceInmToken) ? debtBalanceInmToken : constants.MaxUint256,
+              };
+
+              // Simulate
+              await botContract.callStatic.execute(
+                lParam,
+                sParamToRepayLoan,
+                sParamToSendToReceiver,
+                liquidator.address,
+                { from: liquidator.address }
+              );
+              console.log('[V2 Direct Simulation] OK - proceeding with tx');
+
+              const gasPrice = await provider.getGasPrice();
+              const adjustedGasPrice = gasPrice.mul(gasMultiplier).div(100);
+
+              // Execute
+              tx = await botContract
+                .connect(liquidator)
+                .execute(
+                  lParam,
+                  sParamToRepayLoan,
+                  sParamToSendToReceiver,
+                  liquidator.address,
+                  { gasLimit: 4000000, gasPrice: adjustedGasPrice }
+                );
+
+              console.log(`[V2 Direct TX] Sent: ${tx.hash}`);
+              txReceipt = await tx.wait();
+
+              if (txReceipt.status === 1) {
+                console.log(`[V2 Direct TX] SUCCESS!`);
+                successCollateral = collateralAsset;
+                usedStrategy = 'V2_DIRECT_FLASH';
+                break;
+              } else {
+                throw new Error('Transaction reverted');
+              }
+
+            } catch (err) {
+              const reason = err?.error?.reason || err?.errorName || err?.reason || err?.message || 'Unknown';
+              console.log(`[V2 Direct+MORE] Failed: ${reason.slice(0, 80)}`);
+              lastError = err;
+            }
+          }
+
+          // Try V3 flash source if MORE failed
+          if (!txReceipt) {
+            const v3Pool = strategyResult.strategy === Strategy.V3_FLASH
+              ? strategyResult.pool
+              : strategyResult.alternatives?.find(a => a.strategy === Strategy.V3_FLASH)?.pool;
+
+            if (v3Pool) {
+              for (const slippage of SLIPPAGE_LEVELS) {
+                try {
+                  console.log(`[V2 Direct+V3] Trying V3 flash source, Slippage ${(slippage * 100).toFixed(1)}%...`);
+
+                  const slippageBps = BigInt(Math.floor(slippage * 10000));
+                  const minOutput = totalNeeded.mul(10000n - slippageBps).div(10000n);
+
+                  sParamToRepayLoan = buildV2SwapParamsLocal(
+                    collateralAsset,
+                    debtAsset,
+                    expectedCollateral,
+                    minOutput,
+                    PUNCHSWAP_ROUTER
+                  );
+                  sParamToSendToReceiver = buildEmptySwapParamsLocal();
+
+                  const lParam = {
+                    collateralAsset,
+                    debtAsset,
+                    user: unhealthyUser.user,
+                    amount: effectiveDebtToCover,
+                    transferAmount: 0,
+                    debtToCover: userDebt.gt(debtBalanceInmToken) ? debtBalanceInmToken : constants.MaxUint256,
+                  };
+
+                  await botContract.callStatic.executeFlashV3(
+                    v3Pool,
+                    lParam,
+                    sParamToRepayLoan,
+                    sParamToSendToReceiver,
+                    liquidator.address,
+                    { from: liquidator.address }
+                  );
+                  console.log('[V2 Direct+V3 Simulation] OK');
+
+                  const gasPrice = await provider.getGasPrice();
+                  const adjustedGasPrice = gasPrice.mul(gasMultiplier).div(100);
+
+                  tx = await botContract
+                    .connect(liquidator)
+                    .executeFlashV3(
+                      v3Pool,
+                      lParam,
+                      sParamToRepayLoan,
+                      sParamToSendToReceiver,
+                      liquidator.address,
+                      { gasLimit: 4000000, gasPrice: adjustedGasPrice }
+                    );
+
+                  console.log(`[V2 Direct+V3 TX] Sent: ${tx.hash}`);
+                  txReceipt = await tx.wait();
+
+                  if (txReceipt.status === 1) {
+                    console.log(`[V2 Direct+V3 TX] SUCCESS!`);
+                    successCollateral = collateralAsset;
+                    usedStrategy = 'V3_DIRECT_FLASH';
+                    break;
+                  }
+                } catch (v3Err) {
+                  console.log(`[V2 Direct+V3] Failed: ${(v3Err?.message || '').slice(0, 60)}`);
+                }
+              }
+            }
+          }
+        }
+
+        // ============================================
+        // STRATEGY 5: Eisen API (FALLBACK FINAL)
+        // Solo si todo lo anterior falla
+        // ============================================
+        if (!txReceipt && config.eisen_api_key) {
+          console.log(`[Eisen] Fallback - trying Eisen API...`);
+
+          const flashLoanPremium = effectiveDebtToCover.mul(FLASH_LOAN_PREMIUM_BPS).div(10000n);
+          const totalNeeded = effectiveDebtToCover.add(flashLoanPremium);
+
+          const expectedCollateral = await calculateExpectedCollateral(
+            totalNeeded,
+            collateralAsset,
+            debtAsset,
+            collateralDecimals,
+            debtDecimals
+          );
+
+          for (const slippage of SLIPPAGE_LEVELS) {
+            try {
+              console.log(`[Eisen] Collateral ${colIdx + 1}, Slippage ${(slippage * 100).toFixed(1)}%...`);
 
               // Build Flash Loan params (Eisen API)
               const params = await buildLiquidationParams({
@@ -1460,8 +2576,6 @@ async function main() {
               quote2 = params.quote2;
               estimatedReward = params.estimatedReward;
 
-              realRewardUsd = Number(estimatedReward.toString()) / Math.pow(10, debtDecimals);
-
               const lParam = {
                 collateralAsset,
                 debtAsset,
@@ -1471,7 +2585,7 @@ async function main() {
                 debtToCover: userDebt.gt(debtBalanceInmToken) ? debtBalanceInmToken : constants.MaxUint256,
               };
 
-              // Simulate Flash Loan
+              // Simulate
               await botContract.callStatic.execute(
                 lParam,
                 sParamToRepayLoan,
@@ -1479,12 +2593,12 @@ async function main() {
                 liquidator.address,
                 { from: liquidator.address }
               );
-              console.log('[Eisen FlashLoan Simulation] OK - proceeding with tx');
+              console.log('[Eisen Simulation] OK - proceeding with tx');
 
               const gasPrice = await provider.getGasPrice();
               const adjustedGasPrice = gasPrice.mul(gasMultiplier).div(100);
 
-              // Execute Flash Loan
+              // Execute
               tx = await botContract
                 .connect(liquidator)
                 .execute(
@@ -1492,14 +2606,14 @@ async function main() {
                   sParamToRepayLoan,
                   sParamToSendToReceiver,
                   liquidator.address,
-                  { gasLimit: 2500000, gasPrice: adjustedGasPrice }
+                  { gasLimit: 4000000, gasPrice: adjustedGasPrice }
                 );
 
-              console.log(`[Eisen FlashLoan TX] Sent: ${tx.hash}`);
+              console.log(`[Eisen TX] Sent: ${tx.hash}`);
               txReceipt = await tx.wait();
 
               if (txReceipt.status === 1) {
-                console.log(`[Eisen FlashLoan TX] SUCCESS! Collateral: ${shortAddr(collateralAsset)}, Slippage: ${(slippage * 100).toFixed(1)}%`);
+                console.log(`[Eisen TX] SUCCESS!`);
                 successCollateral = collateralAsset;
                 usedStrategy = 'EISEN_FLASH_LOAN';
                 break;
@@ -1509,13 +2623,8 @@ async function main() {
 
             } catch (err) {
               const reason = err?.error?.reason || err?.errorName || err?.reason || err?.message || 'Unknown';
-              console.log(`[FlashLoan] Failed: ${reason}`);
+              console.log(`[Eisen] Failed: ${reason.slice(0, 80)}`);
               lastError = err;
-
-              const isSwapError = reason.includes('SwapFailed') || reason.includes('Simulation failed') || reason.includes('not profitable') || reason.includes('HTTP error');
-              if (!isSwapError) {
-                break; // Non-swap error, try next collateral
-              }
             }
           }
         }
@@ -1546,23 +2655,52 @@ async function main() {
       // Get collateral token symbol (use address if not available)
       const collateralSymbol = shortAddr(successCollateral);
 
-      // Calculate profit in WFLOW
-      // If quote2 exists (2-swap case), reward is quote2.expectedOutput in WFLOW
-      // If quote2 is null (1-swap case), reward is estimatedReward in WFLOW
-      const rewardWflow = quote2
-        ? Number(quote2.expectedOutput) / 1e18
-        : Number(estimatedReward.toString()) / 1e18;
-
       // Get FLOW price from cache (8 decimals)
       const flowPrice = await getCachedPrice(WFLOW);
       const flowPriceUsd = Number(flowPrice) / 1e8;
       const gasCostUsd = gasCostFlow * flowPriceUsd;
-      const rewardUsd = rewardWflow * flowPriceUsd;
+
+      // Calculate profit based on strategy type
+      // - Eisen with 2 swaps: quote2.expectedOutput is in WFLOW (18 decimals)
+      // - Eisen with 1 swap (debt=WFLOW): estimatedReward is in WFLOW (18 decimals)
+      // - StableKitty: estimatedReward is in debt token (6 decimals for stables)
+      // - V2/V3 Direct: estimatedReward is ~5% of collateral (estimate only)
+      let rewardUsd, rewardDisplay;
+
+      if (quote2) {
+        // Eisen 2-swap: reward is in WFLOW
+        const rewardWflow = Number(quote2.expectedOutput) / 1e18;
+        rewardUsd = rewardWflow * flowPriceUsd;
+        rewardDisplay = `~${rewardWflow.toFixed(4)} WFLOW (~$${rewardUsd.toFixed(2)})`;
+      } else if (usedStrategy?.includes('STABLEKITTY')) {
+        // StableKitty: reward is in debt token (stables = 6 decimals, ~$1 each)
+        const rewardInDebt = Number(estimatedReward.toString()) / Math.pow(10, debtDecimals);
+        rewardUsd = rewardInDebt; // Stables ≈ $1
+        rewardDisplay = `~$${rewardUsd.toFixed(2)} (in debt token)`;
+      } else if (usedStrategy?.includes('DIRECT')) {
+        // V2/V3 Direct: estimatedReward is rough estimate in collateral
+        // Use 5% of debt value as profit estimate (liquidation bonus)
+        rewardUsd = debtValueUsd * 0.05;
+        rewardDisplay = `~$${rewardUsd.toFixed(2)} (estimated 5% bonus)`;
+      } else if (debtAsset.toLowerCase() === WFLOW.toLowerCase()) {
+        // Eisen 1-swap where debt is WFLOW
+        const rewardWflow = Number(estimatedReward.toString()) / 1e18;
+        rewardUsd = rewardWflow * flowPriceUsd;
+        rewardDisplay = `~${rewardWflow.toFixed(4)} WFLOW (~$${rewardUsd.toFixed(2)})`;
+      } else {
+        // Fallback: estimate from debt value
+        rewardUsd = debtValueUsd * 0.05;
+        rewardDisplay = `~$${rewardUsd.toFixed(2)} (estimated)`;
+      }
 
       // Strategy emoji mapping
       const strategyEmoji = {
+        'STABLEKITTY_MORE': '🐱 StableKitty+MORE',
+        'STABLEKITTY_V3': '🐱 StableKitty+V3',
         'V2_FLASH_SWAP': '⚡ V2 FlashSwap',
         'V3_FLASH': '🔷 V3 Flash',
+        'V2_DIRECT_FLASH': '💨 V2 Direct',
+        'V3_DIRECT_FLASH': '💎 V3 Direct',
         'EISEN_FLASH_LOAN': '🌐 Eisen'
       };
       const methodUsed = strategyEmoji[usedStrategy] || '💳 FlashLoan';
@@ -1570,6 +2708,9 @@ async function main() {
       // Check if we did partial liquidation
       const wasPartial = adjustedDebtToCover.lt(debtToCover);
       const partialNote = wasPartial ? ' (partial)' : '';
+
+      // Clear from blacklist on success
+      clearFailedPosition(unhealthyUser.user);
 
       await sendAlert([
         `✅ <b>Liquidation Success!</b> ${methodUsed}${partialNote}`,
@@ -1582,7 +2723,7 @@ async function main() {
         `   Collateral: ${collateralSymbol}`,
         ``,
         `📈 <b>Profit:</b>`,
-        `   Reward: ~${rewardWflow.toFixed(4)} WFLOW (~$${rewardUsd.toFixed(2)})`,
+        `   Reward: ${rewardDisplay}`,
         `   Gas: -${gasCostFlow.toFixed(4)} FLOW (~$${gasCostUsd.toFixed(2)})`,
         ``,
         `🏦 <b>Balance:</b> ${liquidatorFlowBalance.toFixed(2)} FLOW | ${liquidatorWflowBalance.toFixed(4)} WFLOW`,
@@ -1624,6 +2765,20 @@ async function main() {
       // Calculate what we tried
       const debtCoveredUsd = (Number(debtToCover.toString()) / Math.pow(10, debtDecimals));
       const theoreticalBonus = debtCoveredUsd * 0.05;
+
+      // Record failure if it's a swap/profitability error (blacklist systematic failures)
+      const isSwapOrProfitError = errorMsg.includes('SwapFailed') ||
+                                   errorMsg.includes('NoReward') ||
+                                   errorMsg.includes('not profitable') ||
+                                   realRewardUsd < 0; // Negative reward = bad swap economics
+
+      if (isSwapOrProfitError) {
+        recordFailedLiquidation(unhealthyUser.user, errorMsg);
+        const failCount = failedPositions.get(unhealthyUser.user)?.failures || 0;
+        if (failCount >= MAX_FAILURES_BEFORE_BLACKLIST) {
+          console.log(`🚫 Position ${shortAddr(unhealthyUser.user)} BLACKLISTED after ${failCount} failures`);
+        }
+      }
 
       await sendAlert([
         `❌ <b>Liquidation Failed</b>`,
@@ -1813,6 +2968,13 @@ async function quickCheckHotPositions() {
       // Skip dust
       if (debtUsd < MIN_DEBT_USD) return;
 
+      // Skip blacklisted positions
+      if (shouldSkipPosition(user)) {
+        const failed = failedPositions.get(user);
+        console.log(`[QuickCheck] ⏭️  Skipping blacklisted: ${shortAddr(user)} HF: ${hfFloat.toFixed(4)} (${failed.failures} failures)`);
+        return;
+      }
+
       if (hf.lte(constants.WeiPerEther) && hf.gt(0)) {
         // LIQUIDATABLE NOW!
         const hotData = hotPositions.get(user);
@@ -1851,7 +3013,7 @@ async function quickCheckHotPositions() {
     }
 
     // Prepare params in background for positions very close to liquidation
-    // Prepare up to 8 at a time (the closest to liquidation)
+    // Use BATCH prepare for efficiency (1-2 multicalls vs N multicalls)
     if (toPrepare.length > 0 && liquidatable.length === 0) {
       const toPrepareSorted = toPrepare.sort((a, b) => {
         const hfA = hotPositions.get(a.user)?.hf || 2;
@@ -1859,11 +3021,16 @@ async function quickCheckHotPositions() {
         return hfA - hfB; // Lowest HF first
       }).slice(0, 8);
 
+      // Log which positions we're preparing
+      console.log(`[QuickCheck] Batch preparing ${toPrepareSorted.length} positions:`);
       for (const pos of toPrepareSorted) {
-        console.log(`[QuickCheck] Preparing params for ${shortAddr(pos.user)} (HF: ${hotPositions.get(pos.user)?.hf?.toFixed(4)})`);
-        // Don't await - let it run in background
-        prepareLiquidationParams(pos.user, pos.pool, pos.totalDebtBase).catch(() => {});
+        console.log(`  - ${shortAddr(pos.user)} (HF: ${hotPositions.get(pos.user)?.hf?.toFixed(4)})`);
       }
+
+      // Use batch prepare - runs in background (no await)
+      batchPreparePositions(toPrepareSorted).catch(err => {
+        console.error(`[QuickCheck] Batch prepare error: ${err.message}`);
+      });
     }
 
   } catch (err) {
@@ -1877,8 +3044,8 @@ async function quickCheckHotPositions() {
  * Execute liquidation with prepared params (FAST PATH)
  */
 async function executePreparedLiquidation(prepared, freshHF) {
-  const liquidator = new Wallet(config.liquidator_key, provider);
-  const botContract = new Contract(prepared.botAddress, LiquidationAbi, provider);
+  const liquidator = new Wallet(config.liquidator_key, txProvider);
+  const botContract = new Contract(prepared.botAddress, LiquidationAbi, txProvider);
 
   const lParam = {
     collateralAsset: prepared.collateralAsset,
@@ -1913,7 +3080,7 @@ async function executePreparedLiquidation(prepared, freshHF) {
           prepared.sParamToRepayLoan,
           prepared.sParamToSendToReceiver,
           liquidator.address,
-          { gasLimit: 2500000, gasPrice: adjustedGasPrice }
+          { gasLimit: 4000000, gasPrice: adjustedGasPrice }
         );
     } else if (prepared.strategy === Strategy.V3_FLASH) {
       tx = await botContract
@@ -1924,7 +3091,7 @@ async function executePreparedLiquidation(prepared, freshHF) {
           prepared.sParamToRepayLoan,
           prepared.sParamToSendToReceiver,
           liquidator.address,
-          { gasLimit: 2500000, gasPrice: adjustedGasPrice }
+          { gasLimit: 4000000, gasPrice: adjustedGasPrice }
         );
     } else {
       tx = await botContract
@@ -1934,7 +3101,7 @@ async function executePreparedLiquidation(prepared, freshHF) {
           prepared.sParamToRepayLoan,
           prepared.sParamToSendToReceiver,
           liquidator.address,
-          { gasLimit: 2500000, gasPrice: adjustedGasPrice }
+          { gasLimit: 4000000, gasPrice: adjustedGasPrice }
         );
     }
 
@@ -1983,8 +3150,8 @@ let wsReconnectAttempts = 0;
 const MAX_WS_RECONNECT_ATTEMPTS = 10;
 
 function getWebSocketUrl() {
-  // Convert HTTP RPC to WebSocket
-  return config.rpc_url.replace('https://', 'wss://');
+  // Use public Flow WebSocket (free) instead of Alchemy
+  return PUBLIC_RPC.replace('https://', 'wss://');
 }
 
 async function handleNewBlock(blockNumber) {
@@ -2135,11 +3302,21 @@ async function runLoop() {
         console.log(`[Recovery] Bot recovered after ${consecutiveErrors} errors`);
         consecutiveErrors = 0;
         lastErrorMsg = '';
+        // Try switching back to public RPC after recovery
+        if (usingAlchemyFallback) {
+          switchToPublicRpc();
+          console.log(`[RPC] Switched back to public RPC after recovery`);
+        }
       }
     } catch (err) {
       consecutiveErrors++;
       const errorMsg = err.message?.slice(0, 100) || 'Unknown error';
       console.error(`Loop error (${consecutiveErrors}): ${errorMsg}`);
+
+      const isNetworkError = errorMsg.includes('NETWORK_ERROR') ||
+                             errorMsg.includes('could not detect network') ||
+                             errorMsg.includes('ECONNREFUSED') ||
+                             errorMsg.includes('ENOTFOUND');
 
       const isTransientError = errorMsg.includes('missing revert data') ||
                                errorMsg.includes('CALL_EXCEPTION') ||
@@ -2147,10 +3324,16 @@ async function runLoop() {
                                errorMsg.includes('ETIMEDOUT') ||
                                errorMsg.includes('processing response error');
 
+      // Switch to Alchemy fallback on network errors after 2 consecutive failures
+      if (isNetworkError && consecutiveErrors >= 2 && !usingAlchemyFallback) {
+        switchToAlchemyFallback();
+        await sendAlert(`🔄 <b>RPC Fallback</b>\n\nSwitched reads to Alchemy\nReason: ${errorMsg.slice(0, 50)}`);
+      }
+
       if (!isTransientError || consecutiveErrors >= MAX_SILENT_ERRORS || errorMsg !== lastErrorMsg) {
         if (consecutiveErrors >= MAX_SILENT_ERRORS) {
           await sendAlert(`⚠️ <b>Bot Error</b> (${consecutiveErrors}x)\n\n<code>${errorMsg}</code>`);
-        } else if (!isTransientError) {
+        } else if (!isTransientError && !isNetworkError) {
           await sendAlert(`⚠️ <b>Bot Error</b>\n\n<code>${errorMsg}</code>`);
         }
       }

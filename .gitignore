@@ -6,3 +6,12 @@ config.json
 .DS_Store
 
 bot_state.json
+
+# Archived scripts and data
+archive/
+
+# Claude Code instructions (local only)
+CLAUDE.md
+
+# State files
+foundation_state.json
