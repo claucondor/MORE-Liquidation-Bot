@@ -59,16 +59,17 @@ class V2FlashSwapStrategy extends BaseStrategy {
       v2Pool,
       punchswapRouter,
       contractAddress,
-      receiver
+      receiver,
+      slippageBps = 300n // Default 3%
     } = context;
 
     // Calculate flash swap fee (0.3%)
     const flashSwapFee = debtToCover.mul(FEES.FLASH_SWAP_FEE_BPS).div(10000n);
     const totalNeeded = debtToCover.add(flashSwapFee);
 
-    // Estimate output from V2 swap (collateral → debt)
-    // This is a simplified estimate; real quote would be more accurate
-    const estimatedReward = expectedCollateral.mul(5).div(100); // ~5% bonus estimate
+    // Estimate reward with slippage consideration
+    const slippageFactor = 10000n - BigInt(slippageBps);
+    const estimatedReward = expectedCollateral.mul(5).div(100).mul(slippageFactor).div(10000n);
 
     // Build params
     const lParam = buildLiquidationParams(
@@ -78,8 +79,8 @@ class V2FlashSwapStrategy extends BaseStrategy {
       debtToCover
     );
 
-    // Swap collateral → debt via V2 router
-    const minOutput = applySlippage(totalNeeded, 100n); // 1% slippage
+    // Swap collateral → debt via V2 router with DYNAMIC slippage
+    const minOutput = applySlippage(totalNeeded, slippageBps);
     const sParamToRepayLoan = buildV2SwapParams(
       collateralAsset,
       debtAsset,

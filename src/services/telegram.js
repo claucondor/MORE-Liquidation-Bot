@@ -31,15 +31,19 @@ class TelegramService {
 
   /**
    * Send info message (status updates)
+   * @param {string} message - The message to send
+   * @param {Object} options - Optional settings
+   * @param {boolean} options.html - Use HTML parsing (default: false for plain text)
    */
-  async sendInfo(message) {
+  async sendInfo(message, options = {}) {
     if (!this.bot || !this.infoChatId) return;
 
     try {
-      await this.bot.telegram.sendMessage(this.infoChatId, message, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true
-      });
+      const msgOptions = { disable_web_page_preview: true };
+      if (options.html) {
+        msgOptions.parse_mode = 'HTML';
+      }
+      await this.bot.telegram.sendMessage(this.infoChatId, message, msgOptions);
     } catch (err) {
       console.error(`[Telegram] Info error: ${err.message}`);
     }

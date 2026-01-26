@@ -117,6 +117,8 @@ function buildApiSwapParams(routerAddress, calldata, amountIn, minAmountOut) {
 
 /**
  * Build liquidation params
+ * IMPORTANT: debtToCover should match amount! Using MaxUint256 causes the protocol
+ * to try liquidating 50% of total debt, which may exceed our flash loan amount.
  */
 function buildLiquidationParams(collateralAsset, debtAsset, user, amount, debtToCover = null) {
   return {
@@ -125,7 +127,8 @@ function buildLiquidationParams(collateralAsset, debtAsset, user, amount, debtTo
     user,
     amount: amount.toString(),
     transferAmount: '0',
-    debtToCover: debtToCover ? debtToCover.toString() : constants.MaxUint256.toString(),
+    // FIX: Default to amount, not MaxUint256!
+    debtToCover: debtToCover ? debtToCover.toString() : amount.toString(),
   };
 }
 

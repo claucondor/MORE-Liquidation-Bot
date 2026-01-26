@@ -60,15 +60,17 @@ class V2DirectMoreStrategy extends BaseStrategy {
       expectedCollateral,
       punchswapRouter,
       contractAddress,
-      receiver
+      receiver,
+      slippageBps = 300n // Default 3% if not provided
     } = context;
 
     // Calculate flash loan fee (0.05%)
     const flashLoanFee = debtToCover.mul(FEES.FLASH_LOAN_PREMIUM_BPS).div(10000n);
     const totalNeeded = debtToCover.add(flashLoanFee);
 
-    // Estimate reward (~5% liquidation bonus)
-    const estimatedReward = expectedCollateral.mul(5).div(100);
+    // Estimate reward (~5% liquidation bonus minus slippage)
+    const slippageFactor = 10000n - BigInt(slippageBps);
+    const estimatedReward = expectedCollateral.mul(5).div(100).mul(slippageFactor).div(10000n);
 
     // Build params
     const lParam = buildLiquidationParams(
@@ -78,8 +80,8 @@ class V2DirectMoreStrategy extends BaseStrategy {
       debtToCover
     );
 
-    // Swap collateral → debt via V2 router
-    const minOutput = applySlippage(totalNeeded, 100n); // 1% slippage
+    // Swap collateral → debt via V2 router with DYNAMIC slippage
+    const minOutput = applySlippage(totalNeeded, slippageBps);
     const sParamToRepayLoan = buildV2SwapParams(
       collateralAsset,
       debtAsset,
@@ -146,7 +148,8 @@ class V3DirectStrategy extends BaseStrategy {
       v3Fee,
       punchswapRouter,
       contractAddress,
-      receiver
+      receiver,
+      slippageBps = 300n // Default 3%
     } = context;
 
     // Calculate V3 flash fee
@@ -154,7 +157,8 @@ class V3DirectStrategy extends BaseStrategy {
     const flashFee = debtToCover.mul(feeBps).div(1000000n);
     const totalNeeded = debtToCover.add(flashFee);
 
-    const estimatedReward = expectedCollateral.mul(5).div(100);
+    const slippageFactor = 10000n - BigInt(slippageBps);
+    const estimatedReward = expectedCollateral.mul(5).div(100).mul(slippageFactor).div(10000n);
 
     const lParam = buildLiquidationParams(
       collateralAsset,
@@ -163,7 +167,8 @@ class V3DirectStrategy extends BaseStrategy {
       debtToCover
     );
 
-    const minOutput = applySlippage(totalNeeded, 100n);
+    // Dynamic slippage
+    const minOutput = applySlippage(totalNeeded, slippageBps);
     const sParamToRepayLoan = buildV2SwapParams(
       collateralAsset,
       debtAsset,

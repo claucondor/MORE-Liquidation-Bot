@@ -49,7 +49,7 @@ class EisenStrategy extends BaseStrategy {
       contractAddress,
       receiver,
       eisenApiKey,
-      WFLOW
+      wflow: WFLOW
     } = context;
 
     // Build liquidation params
@@ -63,11 +63,12 @@ class EisenStrategy extends BaseStrategy {
     try {
       // Get swap params from Eisen API for collateral → debt
       const swap1Result = await buildSwapParams({
-        tokenIn: collateralAsset,
-        tokenOut: debtAsset,
-        amountIn: expectedCollateral.toString(),
-        receiver: contractAddress,
-        slippage: 1,
+        fromToken: collateralAsset,
+        toToken: debtAsset,
+        fromAmount: expectedCollateral.toString(),
+        fromAddress: contractAddress,
+        toAddress: contractAddress, // Output stays in contract to repay
+        slippage: 0.05, // 5% slippage for safety
         apiKey: eisenApiKey,
       });
 
@@ -81,63 +82,35 @@ class EisenStrategy extends BaseStrategy {
       let quote2 = null;
       let estimatedReward;
 
-      // Calculate expected output
+      // Calculate expected output - convert to BigInt for consistency
       const expectedDebtOutput = swap1Result.quote?.expectedOutput
         ? BigInt(swap1Result.quote.expectedOutput)
-        : expectedCollateral.mul(95).div(100); // Estimate 95% of collateral value
+        : BigInt(expectedCollateral.mul(95).div(100).toString()); // Estimate 95% of collateral value
 
-      // Calculate flash loan fee
-      const flashLoanFee = debtToCover.mul(FEES.FLASH_LOAN_PREMIUM_BPS).div(10000n);
-      const totalNeeded = debtToCover.add(flashLoanFee);
+      // Calculate flash loan fee - convert to BigInt
+      const debtToCoverBigInt = BigInt(debtToCover.toString());
+      const flashLoanFee = debtToCoverBigInt * FEES.FLASH_LOAN_PREMIUM_BPS / 10000n;
+      const totalNeeded = debtToCoverBigInt + flashLoanFee;
 
-      // Calculate reward
+      // Calculate reward (all BigInt now)
       const rewardAmount = expectedDebtOutput > totalNeeded
         ? expectedDebtOutput - totalNeeded
         : 0n;
 
-      // If debt is WFLOW, no need for second swap
-      if (debtAsset.toLowerCase() === WFLOW.toLowerCase()) {
-        sParamToSendToReceiver = {
-          swapType: 0,
-          router: '0x0000000000000000000000000000000000000000',
-          path: '0x',
-          amountIn: '0',
-          amountOutMin: '0',
-          adapters: []
-        };
-        estimatedReward = rewardAmount;
-      } else {
-        // Need second swap: debt → WFLOW
-        const swap2Result = await buildSwapParams({
-          tokenIn: debtAsset,
-          tokenOut: WFLOW,
-          amountIn: rewardAmount.toString(),
-          receiver: receiver,
-          slippage: 1,
-          apiKey: eisenApiKey,
-        });
-
-        if (!swap2Result?.swapParams) {
-          console.log('[Eisen] Failed to get swap2 params, using empty');
-          sParamToSendToReceiver = {
-            swapType: 0,
-            router: '0x0000000000000000000000000000000000000000',
-            path: '0x',
-            amountIn: '0',
-            amountOutMin: '0',
-            adapters: []
-          };
-          estimatedReward = rewardAmount;
-        } else {
-          sParamToSendToReceiver = swap2Result.swapParams;
-          sParamToSendToReceiver.amountIn = '0';
-          sParamToSendToReceiver.amountOutMin = '0';
-          quote2 = swap2Result.quote;
-          estimatedReward = quote2?.expectedOutput
-            ? BigInt(quote2.expectedOutput)
-            : rewardAmount;
-        }
-      }
+      // SIMPLIFIED: Always receive reward in debt token directly
+      // The second swap with Eisen fails because amountIn=0 on-chain
+      // but Eisen routes are optimized for specific amounts
+      // Solution: Skip second swap, receive reward in debt token (stables are fine)
+      sParamToSendToReceiver = {
+        swapType: 0,
+        router: '0x0000000000000000000000000000000000000000',
+        path: '0x',
+        amountIn: '0',
+        amountOutMin: '0',
+        adapters: []
+      };
+      estimatedReward = rewardAmount;
+      console.log(`[Eisen] Reward will be received in debt token (${rewardAmount.toString()})`);
 
       return {
         lParam,

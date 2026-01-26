@@ -32,6 +32,8 @@ const {
   findStableKittyPool,
   sleep,
   calculateDynamicSlippage,
+  calculateSafeLiquidationPercent,
+  calculateOptimalLiquidationAmount,
   calculateGasMultiplier
 } = require('./utils');
 
@@ -189,6 +191,11 @@ const saveState = (state) => {
   }
 };
 
+const shouldSendReport = (state) => {
+  const reportIntervalMs = (config.report_interval_hours || 1) * 60 * 60 * 1000;
+  return Date.now() - state.lastReportTime >= reportIntervalMs;
+};
+
 // ============================================
 // SUBGRAPH FETCHER
 // ============================================
@@ -293,6 +300,10 @@ async function executeLiquidation(context) {
   const liquidator = new Wallet(config.liquidator_key, txProvider);
   const botContract = new Contract(botAddress, LiquidationAbi, liquidator);
 
+  // Calculate dynamic slippage based on position size
+  const slippageBps = calculateDynamicSlippage(debtValueUsd);
+  console.log(`[Liquidation] Dynamic slippage: ${Number(slippageBps) / 100}% for $${debtValueUsd.toFixed(0)} position`);
+
   // Build strategy context
   const strategyContext = {
     collateralAsset,
@@ -307,7 +318,7 @@ async function executeLiquidation(context) {
     receiver: liquidator.address,
     eisenApiKey: config.eisen_api_key,
     punchswapRouter: config.contracts.punchswap?.router,
-    slippage: calculateDynamicSlippage(debtValueUsd),
+    slippageBps, // Dynamic slippage in basis points
     wflow: WFLOW
   };
 
@@ -344,10 +355,13 @@ async function executeLiquidation(context) {
 
       // Simulate first
       console.log(`[Liquidation] Simulating ${methodName}...`);
+      console.log(`[Liquidation] Args: user=${params.lParam?.user}, debt=${params.lParam?.debtAsset?.slice(0,10)}, coll=${params.lParam?.collateralAsset?.slice(0,10)}, amount=${params.lParam?.amount}`);
       try {
         await botContract.callStatic[methodName](...args);
       } catch (simErr) {
-        console.log(`[Liquidation] Simulation failed: ${simErr.message?.slice(0, 80)}`);
+        const reason = simErr.reason || simErr.error?.reason || simErr.error?.message || simErr.message;
+        console.log(`[Liquidation] Simulation failed: ${reason?.slice(0, 150)}`);
+        if (simErr.error?.data) console.log(`[Liquidation] Error data: ${simErr.error.data}`);
         continue;
       }
 
@@ -608,19 +622,33 @@ async function main() {
     ]);
     const userDebt = dInfos[0].amount;
 
-    // Calculate debt to cover (50% max + buffer)
-    const CLOSE_FACTOR = 50n;
-    const maxLiquidatable = userDebt.mul(CLOSE_FACTOR).div(100n);
-    let debtToCover = userDebt.gt(debtBalanceInmToken) ? debtBalanceInmToken : userDebt;
-    debtToCover = debtToCover.gt(maxLiquidatable) ? maxLiquidatable : debtToCover;
+    // Get debt value in USD for dynamic calculations
+    const debtValueUsd = Number(unhealthyUser.totalDebtBase.toString()) / 1e8;
+
+    // Protocol max is 50% of total debt
+    const MAX_CLOSE_FACTOR = 50n;
+    const maxLiquidatable = userDebt.mul(MAX_CLOSE_FACTOR).div(100n);
+
+    // Use automatic optimal amount calculation based on position size and slippage
+    // This starts with smaller amounts for larger positions to reduce price impact
+    // Pool liquidity check can be added later for more precise calculations
+    let debtToCover = calculateOptimalLiquidationAmount(maxLiquidatable, null, debtValueUsd);
+
+    // Also respect available liquidity in the mToken
+    if (debtToCover.gt(debtBalanceInmToken)) {
+      debtToCover = debtBalanceInmToken;
+      console.log(`[Liquidation] Reduced to mToken liquidity: ${debtToCover.toString()}`);
+    }
+
+    const optimalDebtUsd = Number(debtToCover.toString()) / Math.pow(10, debtDecimals);
+    const optimalPercent = (Number(debtToCover.toString()) / Number(userDebt.toString()) * 100).toFixed(1);
+    console.log(`[Liquidation] Position $${debtValueUsd.toFixed(0)} -> auto-selected ${optimalPercent}% ($${optimalDebtUsd.toFixed(0)})`);
+    console.log(`[Liquidation] Starts small for better slippage, can liquidate more after`)
 
     const INTEREST_BUFFER_BPS = 10n;
     debtToCover = debtToCover.mul(10000n + INTEREST_BUFFER_BPS).div(10000n);
 
     if (debtToCover.lte(0)) continue;
-
-    // Skip dust
-    const debtValueUsd = Number(unhealthyUser.totalDebtBase.toString()) / 1e8;
     if (debtValueUsd < MIN_DEBT_USD) {
       console.log(`Skipping dust: ${shortAddr(unhealthyUser.user)} ($${debtValueUsd.toFixed(2)})`);
       continue;
@@ -687,6 +715,179 @@ async function main() {
 
   // Clean expired prepared params
   cleanExpiredPrepared();
+
+  // Calculate dust positions (HF < 1 but debt < MIN_DEBT_USD)
+  const dustPositions = allUsersHealthRes.filter(u => {
+    const isLiquidatable = u.healthFactor.lte(ethersConstants.WeiPerEther) && u.healthFactor.gt(0);
+    const debtUsd = Number(u.totalDebtBase.toString()) / 1e8;
+    return isLiquidatable && debtUsd < MIN_DEBT_USD && debtUsd > 0;
+  });
+
+  // Send periodic status report
+  const state = loadState();
+  if (shouldSendReport(state)) {
+    try {
+      await sendDetailedReport({
+        allUsersHealthRes,
+        unhealthyUsers,
+        wideUnhealthyUsers,
+        dustPositions
+      });
+      state.lastReportTime = Date.now();
+      saveState(state);
+    } catch (err) {
+      console.error(`[Report] Error sending report: ${err.message}`);
+    }
+  }
+}
+
+// ============================================
+// DETAILED STATUS REPORT
+// ============================================
+async function sendDetailedReport({ allUsersHealthRes, unhealthyUsers, wideUnhealthyUsers, dustPositions }) {
+  const liquidator = new Wallet(config.liquidator_key, txProvider);
+
+  // Get liquidator balances
+  const liquidatorFlowBalance = Number((await txProvider.getBalance(liquidator.address)).toString()) / 1e18;
+  const wflowContract = new Contract(WFLOW, ['function balanceOf(address) view returns (uint256)'], txProvider);
+  const liquidatorWflowBalance = Number((await wflowContract.balanceOf(liquidator.address)).toString()) / 1e18;
+
+  // Get token prices
+  const tokenPrices = {};
+  const tokensToPrice = [
+    { symbol: 'WFLOW', address: TOKENS.WFLOW },
+    { symbol: 'ankrFLOW', address: TOKENS.ankrFLOW },
+    { symbol: 'stgUSDC', address: TOKENS.stgUSDC },
+    { symbol: 'USDF', address: TOKENS.USDF },
+    { symbol: 'PYUSD0', address: TOKENS.PYUSD0 },
+  ];
+
+  for (const token of tokensToPrice) {
+    try {
+      const price = await pricingService.getPrice(token.address);
+      tokenPrices[token.symbol] = Number(price.toString()) / 1e8;
+    } catch (err) {
+      tokenPrices[token.symbol] = null;
+    }
+  }
+
+  // Calculate stats
+  const totalDebtAtRisk = wideUnhealthyUsers.reduce((sum, u) => {
+    return sum + Number(u.totalDebtBase.toString()) / 1e8;
+  }, 0);
+
+  // Helper to calculate price drop to liquidation
+  const calculatePriceDrop = (hf) => {
+    const hfNum = Number(hf.toString()) / 1e18;
+    return ((1 - (1.0 / hfNum)) * 100).toFixed(2);
+  };
+
+  // Helper to format price safely
+  const fmtPrice = (p) => p != null ? p.toFixed(4) : 'N/A';
+  const fmtUsd = (n) => n.toLocaleString('en-US', { maximumFractionDigits: 0 });
+
+  // Build report
+  const reportLines = [
+    `📊 MORE Protocol - Status Report`,
+    ``,
+    `💹 Token Prices:`,
+    `   WFLOW: $${fmtPrice(tokenPrices.WFLOW)}`,
+    `   ankrFLOW: $${fmtPrice(tokenPrices.ankrFLOW)}`,
+    `   stgUSDC: $${fmtPrice(tokenPrices.stgUSDC)}`,
+    `   USDF: $${fmtPrice(tokenPrices.USDF)}`,
+    `   PYUSD0: $${fmtPrice(tokenPrices.PYUSD0)}`,
+    ``,
+    `📈 Market Overview:`,
+    `   👥 Users monitored: ${allUsersHealthRes.length}`,
+    `   🔴 Liquidatable now: ${unhealthyUsers.length}`,
+    `   🟡 Near liquidation (HF 1.0-1.10): ${wideUnhealthyUsers.length}`,
+    `   💰 Debt at risk: $${fmtUsd(totalDebtAtRisk)}`,
+  ];
+
+  // Show positions near liquidation with price drop analysis
+  if (wideUnhealthyUsers.length > 0) {
+    reportLines.push(``, `🎯 Closest to Liquidation:`);
+    reportLines.push(`(% = price drop needed)`);
+
+    // Sort by HF ascending (closest first)
+    const topByHF = [...wideUnhealthyUsers]
+      .sort((a, b) => Number(a.healthFactor.toString()) - Number(b.healthFactor.toString()))
+      .slice(0, 5);
+
+    for (const u of topByHF) {
+      const hf = (Number(u.healthFactor.toString()) / 1e18).toFixed(4);
+      const debtUsd = fmtUsd(Number(u.totalDebtBase.toString()) / 1e8);
+      const priceDrop = calculatePriceDrop(u.healthFactor);
+      const status = Number(u.healthFactor.toString()) < 1e18 ? '🔴' : parseFloat(priceDrop) < 3 ? '🟠' : '🟡';
+      reportLines.push(`${status} ${shortAddr(u.user)} HF:${hf} $${debtUsd} -${priceDrop}%`);
+    }
+
+    // Biggest positions (if different)
+    const topByDebt = [...wideUnhealthyUsers]
+      .sort((a, b) => Number(b.totalDebtBase.toString()) - Number(a.totalDebtBase.toString()))
+      .slice(0, 3);
+
+    const topHFUsers = new Set(topByHF.map(u => u.user));
+    const uniqueByDebt = topByDebt.filter(u => !topHFUsers.has(u.user));
+
+    if (uniqueByDebt.length > 0) {
+      reportLines.push(``, `💰 Biggest at Risk:`);
+      for (const u of uniqueByDebt) {
+        const hf = (Number(u.healthFactor.toString()) / 1e18).toFixed(4);
+        const debtUsd = fmtUsd(Number(u.totalDebtBase.toString()) / 1e8);
+        const priceDrop = calculatePriceDrop(u.healthFactor);
+        reportLines.push(`💵 ${shortAddr(u.user)} HF:${hf} $${debtUsd} -${priceDrop}%`);
+      }
+    }
+  }
+
+  // Price impact scenarios
+  if (wideUnhealthyUsers.length > 0 && tokenPrices.WFLOW) {
+    reportLines.push(``, `📉 If WFLOW drops:`);
+    const scenarios = [
+      { drop: 5, price: tokenPrices.WFLOW * 0.95 },
+      { drop: 10, price: tokenPrices.WFLOW * 0.90 },
+      { drop: 15, price: tokenPrices.WFLOW * 0.85 },
+    ];
+
+    for (const scenario of scenarios) {
+      const wouldLiquidate = wideUnhealthyUsers.filter(u => {
+        const priceDrop = parseFloat(calculatePriceDrop(u.healthFactor));
+        return priceDrop <= scenario.drop;
+      }).length;
+      const newDebt = wideUnhealthyUsers
+        .filter(u => parseFloat(calculatePriceDrop(u.healthFactor)) <= scenario.drop)
+        .reduce((sum, u) => sum + Number(u.totalDebtBase.toString()) / 1e8, 0);
+
+      reportLines.push(`   -${scenario.drop}% ($${scenario.price.toFixed(3)}): ${wouldLiquidate} users (~$${fmtUsd(newDebt)})`);
+    }
+  }
+
+  // Liquidator balance
+  reportLines.push(``, `🏦 Liquidator: ${shortAddr(liquidator.address)}`);
+  reportLines.push(`   FLOW: ${liquidatorFlowBalance.toFixed(4)} (~$${(liquidatorFlowBalance * (tokenPrices.WFLOW || 0)).toFixed(2)})`);
+  reportLines.push(`   WFLOW: ${liquidatorWflowBalance.toFixed(4)} (~$${(liquidatorWflowBalance * (tokenPrices.WFLOW || 0)).toFixed(2)})`);
+
+  // Add dust/bad debt section if there are dust positions
+  if (dustPositions && dustPositions.length > 0) {
+    const totalDustDebt = dustPositions.reduce((sum, u) => {
+      return sum + Number(u.totalDebtBase.toString()) / 1e8;
+    }, 0);
+
+    reportLines.push(``, `🧹 Dust/Bad Debt:`);
+    reportLines.push(`   ${dustPositions.length} positions | $${totalDustDebt.toFixed(2)} total`);
+
+    if (totalDustDebt > 100) {
+      reportLines.push(`   ⚠️ Accumulated bad debt is significant!`);
+    }
+  }
+
+  // Footer
+  reportLines.push(``, `━━━━━━━━━━━━━━━━━━━━`);
+  reportLines.push(`Min debt: $${MIN_DEBT_USD} | Report: ${config.report_interval_hours || 1}h`);
+
+  await telegramService.sendInfo(reportLines.join('\n'));
+  console.log('[Report] Status report sent');
 }
 
 // ============================================

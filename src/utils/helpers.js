@@ -133,13 +133,61 @@ function applySlippage(amount, slippageBps) {
 /**
  * Calculate dynamic slippage based on position size
  * Larger positions need more slippage tolerance
+ * Returns slippage in BPS (basis points)
  */
 function calculateDynamicSlippage(debtValueUsd) {
-  if (debtValueUsd < 100) return 0.02;      // 2% for small
-  if (debtValueUsd < 1000) return 0.03;     // 3% for medium
-  if (debtValueUsd < 10000) return 0.05;    // 5% for large
-  if (debtValueUsd < 50000) return 0.07;    // 7% for very large
-  return 0.10;                               // 10% for huge positions
+  if (debtValueUsd < 100) return 200n;      // 2% for small
+  if (debtValueUsd < 1000) return 300n;     // 3% for medium
+  if (debtValueUsd < 10000) return 500n;    // 5% for large
+  if (debtValueUsd < 50000) return 700n;    // 7% for very large
+  return 1000n;                              // 10% for huge positions
+}
+
+/**
+ * Calculate safe liquidation percentage based on debt size
+ * Start SMALL to minimize slippage, can always liquidate more later
+ * The 5% liquidation bonus means even small liquidations are profitable
+ */
+function calculateSafeLiquidationPercent(debtValueUsd) {
+  // For very small positions, liquidate more since slippage impact is low
+  if (debtValueUsd < 500) return 50n;       // < $500: full 50%
+  if (debtValueUsd < 2000) return 30n;      // $500-2K: 30%
+  if (debtValueUsd < 10000) return 20n;     // $2K-10K: 20%
+  if (debtValueUsd < 50000) return 10n;     // $10K-50K: 10%
+  if (debtValueUsd < 100000) return 5n;     // $50K-100K: 5%
+  return 3n;                                 // > $100K: just 3% to minimize impact
+}
+
+/**
+ * Calculate optimal liquidation amount considering pool liquidity
+ * @param {BigNumber} maxDebt - Maximum debt that can be liquidated (50%)
+ * @param {BigNumber} poolLiquidity - Available liquidity in the swap pool
+ * @param {number} debtValueUsd - Total debt value in USD
+ * @returns {BigNumber} - Optimal debt amount to liquidate
+ */
+function calculateOptimalLiquidationAmount(maxDebt, poolLiquidity, debtValueUsd) {
+  const { BigNumber } = require('ethers');
+
+  // Start with safe percentage
+  const safePercent = calculateSafeLiquidationPercent(debtValueUsd);
+  let optimalAmount = maxDebt.mul(safePercent).div(50n); // Scale from max 50%
+
+  // If we have pool liquidity info, ensure we don't exceed 10% of pool
+  // This prevents excessive price impact
+  if (poolLiquidity && poolLiquidity.gt(0)) {
+    const maxFromLiquidity = poolLiquidity.div(10n); // Max 10% of pool
+    if (optimalAmount.gt(maxFromLiquidity)) {
+      optimalAmount = maxFromLiquidity;
+      console.log(`[Liquidation] Reduced amount due to pool liquidity`);
+    }
+  }
+
+  // Ensure we don't exceed protocol max (50%)
+  if (optimalAmount.gt(maxDebt)) {
+    optimalAmount = maxDebt;
+  }
+
+  return optimalAmount;
 }
 
 /**
@@ -176,6 +224,8 @@ module.exports = {
   getTokenSymbol,
   calculateGasMultiplier,
   calculateDynamicSlippage,
+  calculateSafeLiquidationPercent,
+  calculateOptimalLiquidationAmount,
   findStableKittyPool,
   sleep,
   retry,
